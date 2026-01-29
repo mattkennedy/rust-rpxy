@@ -6,7 +6,7 @@ use super::{
   utils_request::InspectParseHost,
 };
 use crate::{
-  backend::{BackendAppManager, LoadBalanceContext},
+  backend::{BackendAppManager, FailoverContext, LoadBalanceContext, UpstreamCandidates},
   error::*,
   forwarder::{ForwardRequest, Forwarder},
   globals::Globals,
@@ -15,7 +15,9 @@ use crate::{
   name_exp::ServerName,
 };
 use derive_builder::Builder;
-use http::{Request, Response, StatusCode};
+use http::{header, Request, Response, StatusCode};
+use http_body_util::BodyExt;
+use hyper::body::Bytes;
 use hyper_util::{client::legacy::connect::Connect, rt::TokioIo};
 use std::{net::SocketAddr, sync::Arc};
 use tokio::io::copy_bidirectional;
@@ -143,41 +145,72 @@ where
     // let request_upgraded = req.extensions_mut().remove::<hyper::upgrade::OnUpgrade>();
     let req_on_upgrade = hyper::upgrade::on(&mut req);
 
-    // Build request from destination information
-    let _context = self
-      .generate_request_forwarded(
-        &client_addr,
-        &listen_addr,
-        &mut req,
-        &upgrade_in_request,
-        upstream_candidates,
-        tls_enabled,
-      )
-      .map_err(|e| HttpError::FailedToGenerateUpstreamRequest(e.to_string()))?;
-
-    debug!(
-      "Request to be forwarded: [uri {}, method: {}, version {:?}, headers {:?}]",
-      req.uri(),
-      req.method(),
-      req.version(),
-      req.headers()
-    );
-    log_data.xff(&req.headers().get("x-forwarded-for"));
-    log_data.upstream(req.uri());
-    //////
-
     //////////////
-    // Forward request to a chosen backend
-    let mut res_backend = self
-      .forwarder
-      .request(req)
-      .await
-      .map_err(|e| HttpError::FailedToGetResponseFromBackend(e.to_string()))?;
+    // Check if failover is enabled and should be used
+    let should_use_failover = upstream_candidates.failover_config.is_some()
+      && upstream_candidates.inner.len() > 1
+      && upgrade_in_request.is_none(); // Disable failover for WebSocket/H2C upgrades
+
+    let (mut res_backend, context_from_lb) = if should_use_failover {
+      // Failover path: buffer body and retry on errors
+      debug!("Failover enabled for this request");
+
+      // Buffer request body if small enough
+      let (req_parts, buffered_body) = self.buffer_request_body(req).await?;
+
+      // Use failover logic - returns (Response, Option<LoadBalanceContext>)
+      self
+        .request_with_failover(
+          req_parts,
+          buffered_body,
+          upstream_candidates,
+          &client_addr,
+          &listen_addr,
+          tls_enabled,
+          &upgrade_in_request,
+          None, // Initial load balancer context
+        )
+        .await?
+    } else {
+      // Normal path: single upstream attempt
+      debug!("Failover disabled or not applicable");
+
+      // Build request from destination information
+      let handler_context = self
+        .generate_request_forwarded(
+          &client_addr,
+          &listen_addr,
+          &mut req,
+          &upgrade_in_request,
+          upstream_candidates,
+          tls_enabled,
+        )
+        .map_err(|e| HttpError::FailedToGenerateUpstreamRequest(e.to_string()))?;
+
+      debug!(
+        "Request to be forwarded: [uri {}, method: {}, version {:?}, headers {:?}]",
+        req.uri(),
+        req.method(),
+        req.version(),
+        req.headers()
+      );
+      log_data.xff(&req.headers().get("x-forwarded-for"));
+      log_data.upstream(req.uri());
+
+      // Forward request to backend
+      let res_backend = self
+        .forwarder
+        .request(req)
+        .await
+        .map_err(|e| HttpError::FailedToGetResponseFromBackend(e.to_string()))?;
+
+      (res_backend, handler_context.context_lb)
+    };
 
     //////////////
     // Process reverse proxy context generated during the forwarding request generation.
     #[cfg(feature = "sticky-cookie")]
-    if let Some(context_from_lb) = _context.context_lb {
+    if let Some(context_from_lb) = context_from_lb {
       let res_headers = res_backend.headers_mut();
       if let Err(e) = set_sticky_cookie_lb_context(res_headers, &context_from_lb) {
         return Err(HttpError::FailedToAddSetCookeInResponse(e.to_string()));
@@ -233,5 +266,213 @@ where
     });
 
     Ok(res_backend)
+  }
+
+  /// Buffer request body if it's small enough for failover retries
+  async fn buffer_request_body(&self, req: Request<RequestBody>) -> HttpResult<(http::request::Parts, Option<Bytes>)> {
+    let (parts, body) = req.into_parts();
+
+    // Check Content-Length header to determine if we should buffer
+    if let Some(content_length) = parts.headers.get(header::CONTENT_LENGTH) {
+      let len = content_length
+        .to_str()
+        .map_err(|e| HttpError::Other(anyhow::anyhow!("Invalid content-length header: {}", e)))?
+        .parse::<usize>()
+        .map_err(|e| HttpError::Other(anyhow::anyhow!("Failed to parse content-length: {}", e)))?;
+
+      if len > crate::constants::MAX_BUFFERED_BODY_SIZE {
+        debug!(
+          "Request body too large to buffer ({} bytes > {} bytes), failover disabled for this request",
+          len,
+          crate::constants::MAX_BUFFERED_BODY_SIZE
+        );
+        return Ok((parts, None));
+      }
+    }
+
+    // Buffer the body for potential retries
+    let body_bytes = body
+      .collect()
+      .await
+      .map_err(|e| HttpError::Other(anyhow::anyhow!("Failed to collect request body: {}", e)))?
+      .to_bytes();
+
+    if body_bytes.len() > crate::constants::MAX_BUFFERED_BODY_SIZE {
+      debug!(
+        "Actual body size too large ({} bytes > {} bytes), failover disabled",
+        body_bytes.len(),
+        crate::constants::MAX_BUFFERED_BODY_SIZE
+      );
+      return Ok((parts, None));
+    }
+
+    Ok((parts, Some(body_bytes)))
+  }
+
+  /// Reconstruct a request from parts and buffered body
+  async fn reconstruct_request(&self, parts: &http::request::Parts, body_bytes: Bytes) -> HttpResult<Request<RequestBody>> {
+    use crate::hyper_ext::body::IncomingLike;
+
+    // Create an IncomingLike body channel
+    let content_length = body_bytes.len() as u64;
+    let decoded_length = crate::hyper_ext::body::DecodedLength::new(content_length);
+    let (mut tx, rx) = IncomingLike::new_channel(decoded_length, false);
+
+    // Send the body bytes through the channel
+    if let Err(e) = tx.send_data(body_bytes).await {
+      return Err(HttpError::Other(anyhow::anyhow!(
+        "Failed to send buffered body data: {}",
+        e
+      )));
+    }
+
+    // Create request with IncomingLike body
+    let body = RequestBody::IncomingLike(rx);
+    Ok(Request::from_parts(parts.clone(), body))
+  }
+
+  /// Handle request with failover support - tries multiple upstreams on error
+  async fn request_with_failover(
+    &self,
+    req_parts: http::request::Parts,
+    buffered_body: Option<Bytes>,
+    upstream_candidates: &UpstreamCandidates,
+    client_addr: &SocketAddr,
+    listen_addr: &SocketAddr,
+    tls_enabled: bool,
+    upgrade: &Option<String>,
+    initial_lb_context: Option<LoadBalanceContext>,
+  ) -> HttpResult<(Response<ResponseBody>, Option<LoadBalanceContext>)> {
+    let failover_config = upstream_candidates
+      .failover_config
+      .as_ref()
+      .expect("failover_config should be Some when this method is called");
+
+    // Get initial upstream from load balancer
+    let (initial_upstream_opt, context_lb) = upstream_candidates.get(&initial_lb_context);
+    let initial_upstream = initial_upstream_opt.ok_or(HttpError::NoUpstreamCandidates)?;
+
+    let initial_idx = upstream_candidates
+      .find_upstream_index(initial_upstream)
+      .ok_or(HttpError::NoUpstreamCandidates)?;
+
+    // Initialize failover context
+    let mut failover_ctx = FailoverContext::new(initial_idx);
+    let max_retries = failover_config
+      .max_retries
+      .min(upstream_candidates.inner.len() - 1);
+    let mut last_response: Option<Response<ResponseBody>> = None;
+    let mut last_lb_context: Option<LoadBalanceContext> = context_lb;
+
+    debug!(
+      "Failover enabled: initial_upstream_idx={}, max_retries={}, trigger_statuses={:?}, on_connection_failure={}",
+      initial_idx, max_retries, failover_config.trigger_statuses, failover_config.on_connection_failure
+    );
+
+    // Retry loop
+    let mut attempt_number = 0;
+    loop {
+      // Get next upstream to try
+      let Some((upstream_idx, _upstream)) = upstream_candidates.get_next(&mut failover_ctx) else {
+        break; // No more upstreams
+      };
+
+      // Reconstruct request with buffered body (or fail if we can't retry)
+      let req = if let Some(ref body_bytes) = buffered_body {
+        // Reconstruct request with buffered body for retry
+        self.reconstruct_request(&req_parts, body_bytes.clone()).await?
+      } else if attempt_number > 0 {
+        warn!("Cannot retry: body not buffered (too large or no body)");
+        break;
+      } else {
+        // First attempt with no body (already consumed during buffering attempt)
+        // Create an empty IncomingLike body
+        use crate::hyper_ext::body::{DecodedLength, IncomingLike};
+        let (_tx, rx) = IncomingLike::new_channel(DecodedLength::ZERO, false);
+        Request::from_parts(req_parts.clone(), RequestBody::IncomingLike(rx))
+      };
+
+      // Prepare request for this specific upstream
+      let mut forwarded_req = req;
+
+      let retry_context = self
+        .generate_request_forwarded(
+          client_addr,
+          listen_addr,
+          &mut forwarded_req,
+          upgrade,
+          upstream_candidates,
+          tls_enabled,
+        )
+        .map_err(|e| HttpError::FailedToGenerateUpstreamRequest(e.to_string()))?;
+
+      // For failover retries, we need to manually override the upstream URI AFTER generate_request_forwarded
+      // because generate_request_forwarded uses the load balancer which always picks the same upstream
+      if attempt_number > 0 {
+        // Manually update the URI to point to the selected upstream
+        let upstream = &upstream_candidates.inner[upstream_idx];
+        let original_pq = forwarded_req.uri().path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
+
+        let new_uri = http::Uri::builder()
+          .scheme(upstream.uri.scheme().ok_or(HttpError::Other(anyhow::anyhow!("Missing scheme")))?.as_str())
+          .authority(upstream.uri.authority().ok_or(HttpError::Other(anyhow::anyhow!("Missing authority")))?.as_str())
+          .path_and_query(original_pq)
+          .build()
+          .map_err(|e| HttpError::Other(anyhow::anyhow!("Failed to build URI: {}", e)))?;
+
+        *forwarded_req.uri_mut() = new_uri;
+      }
+
+      debug!(
+        "Failover attempt {} to upstream[{}]: {}",
+        failover_ctx.retry_count + 1,
+        upstream_idx,
+        forwarded_req.uri()
+      );
+
+      // Send request
+      let response_result = self.forwarder.request(forwarded_req).await;
+
+      // Check if we should retry
+      match response_result {
+        Ok(response) => {
+          let status = response.status();
+          if failover_config.trigger_statuses.contains(&status.as_u16()) {
+            warn!(
+              "Upstream[{}] returned error status {}, attempting failover",
+              upstream_idx, status
+            );
+            last_response = Some(response);
+            last_lb_context = retry_context.context_lb;
+          } else {
+            debug!("Upstream[{}] returned success status {}", upstream_idx, status);
+            return Ok((response, retry_context.context_lb));
+          }
+        }
+        Err(e) => {
+          if failover_config.on_connection_failure {
+            warn!("Upstream[{}] connection failed: {}, attempting failover", upstream_idx, e);
+            last_lb_context = retry_context.context_lb;
+          } else {
+            return Err(HttpError::FailedToGetResponseFromBackend(e.to_string()));
+          }
+        }
+      }
+
+      // Check retry limits BEFORE incrementing
+      if !failover_ctx.can_retry(max_retries) {
+        debug!("Max retries ({}) reached, returning last response", max_retries);
+        break;
+      }
+
+      // Increment counters for next iteration
+      attempt_number += 1;
+      failover_ctx.increment_retry();
+    }
+
+    // All upstreams failed - return last response or error
+    last_response
+      .map(|r| (r, last_lb_context))
+      .ok_or(HttpError::AllUpstreamsFailed)
   }
 }

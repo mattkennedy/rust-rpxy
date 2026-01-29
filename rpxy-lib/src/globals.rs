@@ -153,6 +153,9 @@ pub struct ReverseProxyConfig {
   pub upstream: Vec<UpstreamUri>,
   pub upstream_options: Option<Vec<String>>,
   pub load_balance: Option<String>,
+  pub failover_on_statuses: Option<Vec<u16>>,
+  pub failover_on_connection_failure: Option<bool>,
+  pub max_failover_retries: Option<usize>,
 }
 
 /// Configuration parameters for single upstream destination from a reverse proxy

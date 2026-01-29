@@ -1,7 +1,10 @@
 #[cfg(feature = "sticky-cookie")]
 use super::load_balance::LoadBalanceStickyBuilder;
-use super::load_balance::{
-  LoadBalance, LoadBalanceContext, LoadBalanceRandomBuilder, LoadBalanceRoundRobinBuilder, load_balance_options as lb_opts,
+use super::{
+  failover::FailoverConfig,
+  load_balance::{
+    LoadBalance, LoadBalanceContext, LoadBalanceRandomBuilder, LoadBalanceRoundRobinBuilder, load_balance_options as lb_opts,
+  },
 };
 // use super::{BytesName, LbContext, PathNameBytesExp, UpstreamOption};
 use super::upstream_opts::UpstreamOption;
@@ -40,6 +43,7 @@ impl TryFrom<&AppConfig> for PathManager {
         .replace_path(&rpc.replace_path)
         .load_balance(&rpc.load_balance, &upstream_vec, &app_config.server_name, &rpc.path)
         .options(&rpc.upstream_options)
+        .failover(&rpc.failover_on_statuses, &rpc.failover_on_connection_failure, &rpc.max_failover_retries, &upstream_vec)
         .build()
         .unwrap();
       inner.insert(elem.path.clone(), elem);
@@ -137,6 +141,10 @@ pub struct UpstreamCandidates {
   #[builder(setter(custom), default)]
   /// Activated upstream options defined in [[UpstreamOption]]
   pub options: HashSet<UpstreamOption>,
+
+  #[builder(setter(custom), default)]
+  /// Failover configuration (enabled when multiple upstreams exist)
+  pub failover_config: Option<FailoverConfig>,
 }
 
 impl UpstreamCandidatesBuilder {
@@ -218,6 +226,44 @@ impl UpstreamCandidatesBuilder {
     self.options = Some(opts);
     self
   }
+
+  /// Set the failover configuration
+  pub fn failover(
+    &mut self,
+    statuses: &Option<Vec<u16>>,
+    on_connection_failure: &Option<bool>,
+    max_retries: &Option<usize>,
+    upstream_vec: &[Upstream],
+  ) -> &mut Self {
+    let num_upstreams = upstream_vec.len();
+
+    // Only enable failover if:
+    // 1. Multiple upstreams exist, AND
+    // 2. At least one failover option is specified
+    let should_enable_failover = num_upstreams > 1
+      && (statuses.is_some() || on_connection_failure.is_some() || max_retries.is_some());
+
+    if should_enable_failover {
+      let failover_config = FailoverConfig::new(
+        statuses.clone(),
+        *on_connection_failure,
+        *max_retries,
+        num_upstreams,
+      );
+
+      // Validate the config (should always pass since we validated in toml.rs, but double-check)
+      if let Err(e) = failover_config.validate() {
+        error!("Invalid failover configuration: {}", e);
+        self.failover_config = None;
+      } else {
+        self.failover_config = Some(Some(failover_config));
+      }
+    } else {
+      self.failover_config = Some(None);
+    }
+
+    self
+  }
 }
 
 impl UpstreamCandidates {
@@ -228,6 +274,23 @@ impl UpstreamCandidates {
     debug!("Context to LB (Cookie in Request): {:?}", context_to_lb);
     debug!("Context from LB (Set-Cookie in Response): {:?}", pointer_to_upstream.context);
     (self.inner.get(pointer_to_upstream.ptr), pointer_to_upstream.context)
+  }
+
+  /// Get next untried upstream for failover (sequential selection starting from initial index)
+  pub fn get_next(&self, failover_ctx: &mut super::failover::FailoverContext) -> Option<(usize, &Upstream)> {
+    for idx in 0..self.inner.len() {
+      let actual_idx = (failover_ctx.initial_upstream_idx + idx) % self.inner.len();
+      if !failover_ctx.has_tried(actual_idx) {
+        failover_ctx.mark_tried(actual_idx);
+        return Some((actual_idx, &self.inner[actual_idx]));
+      }
+    }
+    None
+  }
+
+  /// Find the index of a given upstream in the candidates list
+  pub fn find_upstream_index(&self, upstream: &Upstream) -> Option<usize> {
+    self.inner.iter().position(|u| u.uri == upstream.uri)
   }
 }
 

@@ -1,0 +1,173 @@
+# rpxy Failover Configuration Example
+# This example demonstrates automatic upstream failover for gradual migration scenarios
+
+listen_port = 8080
+listen_port_tls = 8443
+
+##############################################
+# Example 1: Gradual Migration (Elixir → Ruby)
+##############################################
+# Try new Elixir backend first, automatically fall back to Ruby on errors
+
+[apps.api_migration]
+server_name = 'api.example.com'
+
+[[apps.api_migration.reverse_proxy]]
+path = '/api'
+upstream = [
+  { location = 'elixir-backend:4000', tls = false },  # Try first
+  { location = 'ruby-backend:3000', tls = false },    # Automatic fallback
+]
+
+# Failover configuration
+failover_on_statuses = [404, 501, 502]      # Retry on these status codes
+                                             # 404: Elixir route not implemented yet
+                                             # 501: Not Implemented
+                                             # 502: Bad Gateway
+failover_on_connection_failure = true       # Retry on connection errors
+max_failover_retries = 1                    # Try both upstreams (default: upstream.len() - 1)
+
+# Optional: Use round-robin for initial selection, failover handles errors
+load_balance = "none"  # Always try Elixir first, then Ruby on error
+
+##############################################
+# Example 2: High Availability with Multiple Backends
+##############################################
+
+[apps.ha_service]
+server_name = 'service.example.com'
+
+[[apps.ha_service.reverse_proxy]]
+upstream = [
+  { location = 'backend1:8080', tls = false },
+  { location = 'backend2:8080', tls = false },
+  { location = 'backend3:8080', tls = false },
+]
+
+# Failover on common error codes
+failover_on_statuses = [502, 503, 504]  # Default: Bad Gateway, Service Unavailable, Gateway Timeout
+failover_on_connection_failure = true   # Default: true
+max_failover_retries = 2                # Try up to 3 upstreams total
+
+# Use round-robin to distribute load, failover provides resilience
+load_balance = "round_robin"
+
+##############################################
+# Example 3: Canary Deployment
+##############################################
+
+[apps.canary]
+server_name = 'canary.example.com'
+
+[[apps.canary.reverse_proxy]]
+upstream = [
+  { location = 'canary-v2:8080', tls = false },   # New version
+  { location = 'stable-v1:8080', tls = false },   # Stable fallback
+]
+
+# Only failover on specific error codes that indicate the canary isn't ready
+failover_on_statuses = [503]            # Only Service Unavailable triggers fallback
+failover_on_connection_failure = true   # Connection errors also trigger fallback
+max_failover_retries = 1
+
+##############################################
+# Example 4: No Failover (Single Upstream)
+##############################################
+
+[apps.simple]
+server_name = 'simple.example.com'
+
+[[apps.simple.reverse_proxy]]
+upstream = [
+  { location = 'backend:8080', tls = false },
+]
+# Failover is automatically disabled with single upstream
+
+##############################################
+# Example 5: Multiple Upstreams WITHOUT Failover
+##############################################
+
+[apps.no_failover]
+server_name = 'no-failover.example.com'
+
+[[apps.no_failover.reverse_proxy]]
+upstream = [
+  { location = 'backend1:8080', tls = false },
+  { location = 'backend2:8080', tls = false },
+]
+load_balance = "round_robin"
+# No failover_* options = failover disabled, uses normal load balancing
+
+##############################################
+# Example 6: Path-Based with Different Failover Configs
+##############################################
+
+[apps.mixed]
+server_name = 'mixed.example.com'
+
+# Critical API path - aggressive failover
+[[apps.mixed.reverse_proxy]]
+path = '/api/critical'
+upstream = [
+  { location = 'critical1:8080', tls = false },
+  { location = 'critical2:8080', tls = false },
+  { location = 'critical3:8080', tls = false },
+]
+failover_on_statuses = [500, 502, 503, 504]  # Failover on any server error
+failover_on_connection_failure = true
+max_failover_retries = 2
+
+# Best-effort path - limited failover
+[[apps.mixed.reverse_proxy]]
+path = '/api/best-effort'
+upstream = [
+  { location = 'besteffort1:8080', tls = false },
+  { location = 'besteffort2:8080', tls = false },
+]
+failover_on_statuses = [502, 503]        # Only critical errors
+failover_on_connection_failure = false   # Don't retry on connection failure
+max_failover_retries = 1
+
+##############################################
+# Important Notes
+##############################################
+
+# 1. Request Body Buffering:
+#    - Request bodies < 1MB are automatically buffered for retries
+#    - Larger bodies cannot be retried (failover disabled for that request)
+#    - GET/HEAD requests always support failover (no body)
+
+# 2. WebSocket and HTTP/2 Upgrades:
+#    - Failover is automatically disabled for upgrade requests
+#    - These are stateful connections that cannot be replayed
+
+# 3. Default Values:
+#    - failover_on_statuses: [502, 503, 504] (if any failover option is set)
+#    - failover_on_connection_failure: true
+#    - max_failover_retries: (number of upstreams - 1)
+
+# 4. Status Codes:
+#    - Only 4xx and 5xx status codes are valid for failover_on_statuses
+#    - Common choices:
+#      - 404: Not Found (useful for partial migrations)
+#      - 500: Internal Server Error
+#      - 501: Not Implemented
+#      - 502: Bad Gateway
+#      - 503: Service Unavailable
+#      - 504: Gateway Timeout
+
+# 5. Load Balancing Interaction:
+#    - Failover and load balancing work together
+#    - Load balancer selects initial upstream
+#    - Failover tries remaining upstreams sequentially on error
+#    - Sticky sessions are preserved during failover
+
+# 6. Performance Impact:
+#    - Successful requests: no overhead (failover not triggered)
+#    - Failed requests: additional latency from retry attempts
+#    - Memory: ~1MB buffer per request for bodies that need retry
+
+# 7. Observability:
+#    - Failover attempts are logged with upstream indices
+#    - Final response is always returned to client (even if all upstreams fail)
+#    - Check logs for "Failover attempt", "attempting failover", "All upstreams failed"

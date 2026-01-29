@@ -5,6 +5,7 @@ pub const UPSTREAM_IDLE_TIMEOUT_SEC: u64 = 20;
 pub const TLS_HANDSHAKE_TIMEOUT_SEC: u64 = 15; // default as with firefox browser
 pub const MAX_CLIENTS: usize = 512;
 pub const MAX_CONCURRENT_STREAMS: u32 = 64;
+pub const MAX_BUFFERED_BODY_SIZE: usize = 1024 * 1024; // 1MB for failover retries
 
 #[allow(non_snake_case)]
 #[cfg(any(feature = "http3-quinn", feature = "http3-s2n"))]

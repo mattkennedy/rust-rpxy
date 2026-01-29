@@ -175,6 +175,9 @@ pub struct ReverseProxyOption {
   pub upstream: Vec<UpstreamParams>,
   pub upstream_options: Option<Vec<String>>,
   pub load_balance: Option<String>,
+  pub failover_on_statuses: Option<Vec<u16>>,
+  pub failover_on_connection_failure: Option<bool>,
+  pub max_failover_retries: Option<usize>,
 }
 
 #[derive(Deserialize, Debug, Default, PartialEq, Eq, Clone)]
@@ -400,12 +403,27 @@ impl TryInto<Vec<ReverseProxyConfig>> for &Application {
       }
       let upstream = upstream_res.into_iter().map(|v| v.unwrap()).collect();
 
+      // Validate failover status codes if present
+      if let Some(ref statuses) = rpo.failover_on_statuses {
+        for &status in statuses {
+          ensure!(
+            (400..600).contains(&status),
+            "[{}] Failover status code {} must be in range 400-599",
+            &_server_name_string,
+            status
+          );
+        }
+      }
+
       reverse_proxies.push(ReverseProxyConfig {
         path: rpo.path.clone(),
         replace_path: rpo.replace_path.clone(),
         upstream,
         upstream_options: rpo.upstream_options.clone(),
         load_balance: rpo.load_balance.clone(),
+        failover_on_statuses: rpo.failover_on_statuses.clone(),
+        failover_on_connection_failure: rpo.failover_on_connection_failure,
+        max_failover_retries: rpo.max_failover_retries,
       })
     }
 
