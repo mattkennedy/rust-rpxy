@@ -1,0 +1,181 @@
+########################################
+#                                      #
+#       rpxy configuration             #
+#                                      #
+########################################
+
+###################################
+#         Global settings         #
+###################################
+# Both or either one of http/https ports must be specified
+listen_port = 80
+listen_port_tls = 443
+
+# Optional: if you listen on a custom port but redirect via firewall to 443
+# https_redirection_port = 443
+
+# Optional
+# tcp_listen_backlog = 1024
+# max_concurrent_streams = 100
+# max_clients = 512
+# listen_ipv6 = false
+
+###################################
+#         Backend settings        #
+###################################
+[apps]
+
+######################################################################
+## Example: proxy localhost traffic to a local backend
+[apps.example]
+server_name = 'localhost'
+
+# No TLS for local development — uncomment and configure for HTTPS
+# tls = { https_redirection = true, tls_cert_path = './server.crt', tls_cert_key_path = './server.key' }
+
+[[apps.example.reverse_proxy]]
+upstream = [
+  { location = '127.0.0.1:3000', tls = false },
+]
+# load_balance = "round_robin" # or "random", "sticky", "none" (default)
+
+# Example: route /api requests to a different backend
+# [[apps.example.reverse_proxy]]
+# path = '/api'
+# upstream = [
+#   { location = '127.0.0.1:4000', tls = false },
+# ]
+######################################################################
+
+######################################################################
+[apps.assistant]
+server_name = 'assistant.touchpoint.test'
+tls = {
+    https_redirection = true, tls_cert_path = '/Users/mattkennedy/.config/rpxy/touchpoint.test+5.pem', tls_cert_key_path = '/Users/mattkennedy/.config/rpxy/touchpoint.test+5-key.pem' }
+
+[[apps.assistant.reverse_proxy]]
+upstream = [
+  { location = '127.0.0.1:4006', tls = false },
+]
+######################################################################
+
+######################################################################
+[apps.api]
+server_name = 'api.touchpoint.test'
+tls = {
+    https_redirection = true, tls_cert_path = '/Users/mattkennedy/.config/rpxy/touchpoint.test+5.pem', tls_cert_key_path = '/Users/mattkennedy/.config/rpxy/touchpoint.test+5-key.pem' }
+
+[[apps.api.reverse_proxy]]
+upstream = [
+  { location = '127.0.0.1:4000', tls = false },
+  { location = '127.0.0.1:3000', tls = false },
+]
+failover_on_statuses = [400, 404, 502, 503, 504]
+failover_on_connection_failure = true
+max_failover_retries = 1
+######################################################################
+
+######################################################################
+[apps.cms]
+server_name = 'cms.touchpoint.test'
+tls = {
+    https_redirection = true, tls_cert_path = '/Users/mattkennedy/.config/rpxy/touchpoint.test+5.pem', tls_cert_key_path = '/Users/mattkennedy/.config/rpxy/touchpoint.test+5-key.pem' }
+
+[[apps.cms.reverse_proxy]]
+upstream = [
+  { location = '127.0.0.1:3000', tls = false },
+  { location = '127.0.0.1:4000', tls = false },
+]
+failover_on_statuses = [400, 404, 502, 503, 504]
+failover_on_connection_failure = true
+max_failover_retries = 1
+######################################################################
+
+######################################################################
+[apps.meeting]
+server_name = 'meeting.touchpoint.test'
+tls = {
+    https_redirection = true, tls_cert_path = '/Users/mattkennedy/.config/rpxy/touchpoint.test+5.pem', tls_cert_key_path = '/Users/mattkennedy/.config/rpxy/touchpoint.test+5-key.pem' }
+
+[[apps.meeting.reverse_proxy]]
+upstream = [
+  { location = '127.0.0.1:4007', tls = false },
+]
+######################################################################
+
+######################################################################
+[apps.openproperty]
+server_name = 'openproperty.test'
+tls = {
+    https_redirection = true, tls_cert_path = '/Users/mattkennedy/.config/rpxy/openproperty.test+1.pem', tls_cert_key_path = '/Users/mattkennedy/.config/rpxy/openproperty.test+1-key.pem' }
+
+[[apps.openproperty.reverse_proxy]]
+upstream = [
+  { location = '127.0.0.1:8000', tls = false },
+]
+######################################################################
+
+######################################################################
+[apps.touchpoint]
+server_name = 'touchpoint.test'
+tls = {
+    https_redirection = true, tls_cert_path = '/Users/mattkennedy/.config/rpxy/touchpoint.test+5.pem', tls_cert_key_path = '/Users/mattkennedy/.config/rpxy/touchpoint.test+5-key.pem' }
+
+[[apps.touchpoint.reverse_proxy]]
+upstream = [
+  { location = '127.0.0.1:4000', tls = false },
+  { location = '127.0.0.1:3000', tls = false },
+]
+failover_on_statuses = [400, 404, 502, 503, 504]
+failover_on_connection_failure = true
+max_failover_retries = 1
+######################################################################
+
+######################################################################
+## Android emulator access via nip.io (10.0.2.2 = host loopback)
+[apps.api_emulator]
+server_name = 'api.touchpoint.10.0.2.2.nip.io'
+tls = {
+    https_redirection = true, tls_cert_path = '/Users/mattkennedy/.config/rpxy/touchpoint.test+5.pem', tls_cert_key_path = '/Users/mattkennedy/.config/rpxy/touchpoint.test+5-key.pem' }
+
+[[apps.api_emulator.reverse_proxy]]
+upstream = [
+  { location = '127.0.0.1:4000', tls = false },
+  { location = '127.0.0.1:3000', tls = false },
+]
+failover_on_statuses = [400, 404, 502, 503, 504]
+failover_on_connection_failure = true
+max_failover_retries = 1
+######################################################################
+
+######################################################################
+[apps.cms_emulator]
+server_name = 'cms.touchpoint.10.0.2.2.nip.io'
+tls = {
+    https_redirection = true, tls_cert_path = '/Users/mattkennedy/.config/rpxy/touchpoint.test+5.pem', tls_cert_key_path = '/Users/mattkennedy/.config/rpxy/touchpoint.test+5-key.pem' }
+
+[[apps.cms_emulator.reverse_proxy]]
+upstream = [
+  { location = '127.0.0.1:3000', tls = false },
+]
+######################################################################
+
+###################################
+#      Experimental settings      #
+###################################
+[experimental]
+# If true, SNI consistency check between TLS ClientHello and HTTP Host header is ignored.
+# Keep false unless you have a specific reason.
+ignore_sni_consistency = false
+
+# Force connection handling timeout in seconds. 0 = infinite. [default: 0]
+# connection_handling_timeout = 0
+
+# Uncomment to enable HTTP/3 (QUIC)
+# [experimental.h3]
+# alt_svc_max_age = 3600
+# request_max_body_size = 65536
+# max_concurrent_connections = 10000
+# max_concurrent_bidistream = 100
+# max_concurrent_unistream = 100
+# max_idle_timeout = 10
