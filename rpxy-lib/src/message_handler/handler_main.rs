@@ -217,8 +217,9 @@ where
       log_data.xff(&req.headers().get(header_defs::X_FORWARDED_FOR));
       log_data.upstream(req.uri());
 
-      // Capture the method before `req` is consumed so passive health can gate
-      // negative observations on idempotency.
+      // `forwarder.request(req)` consumes `req`; clone the method first so the
+      // post-response idempotency gate still has it available. `Method::clone` is
+      // a no-op for the standard variants used by ~all real traffic.
       let req_method = req.method().clone();
       let res_result = self.forwarder.request(req).await;
       // Feed the outcome into passive health (no-op unless passive_health is configured).
@@ -568,6 +569,15 @@ fn is_idempotent_method(method: &Method) -> bool {
   )
 }
 
+/// True when this method+config combination is allowed to record a negative passive
+/// health observation. Idempotent methods always pass; non-idempotent ones require
+/// the operator to opt in via `failover_non_idempotent_methods`. Gate exists to
+/// prevent a DoS amplification path where an attacker uses crafted POSTs that
+/// reproducibly elicit 502 to take an upstream out of rotation.
+fn allow_negative_observation(cfg: &crate::backend::FailoverConfig, method: &Method) -> bool {
+  cfg.retry_non_idempotent || is_idempotent_method(method)
+}
+
 /// Feed a real-traffic outcome into the upstream's `UpstreamHealth` counter.
 /// No-op unless `passive_health` is configured for the route AND the upstream has
 /// `health-check` configured (which provides the `UpstreamHealth` slot). A flipped
@@ -589,9 +599,7 @@ fn record_passive_health(upstream_candidates: &UpstreamCandidates, chosen_idx: u
     if cfg.passive_health.is_none() {
       return;
     }
-    if !ok && !cfg.retry_non_idempotent && !is_idempotent_method(method) {
-      // Non-idempotent failure on a route that didn't opt into non-idempotent retry —
-      // skip the negative observation to avoid the DoS amplification path.
+    if !ok && !allow_negative_observation(cfg, method) {
       return;
     }
     let Some(upstream) = upstream_candidates.inner.get(chosen_idx) else {

@@ -64,9 +64,10 @@ pub struct FailoverConfig {
   /// RFC 9110 §9.2.2 only lists GET/HEAD/PUT/DELETE/OPTIONS/TRACE as idempotent;
   /// retrying others risks double-write side effects.
   pub retry_non_idempotent: bool,
-  /// Precomputed union of every status that triggers retry — built once at config-build
-  /// time so the request hot path returns a cheap `Arc::clone` instead of allocating a
-  /// fresh `HashSet` per request.
+  /// Precomputed union of every status that triggers retry. Built once in `build` so
+  /// `all_retry_statuses()` returns an `Arc::clone` rather than allocating a fresh
+  /// `HashSet` per failover-eligible request — the union is fully determined by config
+  /// and never changes for the lifetime of an `UpstreamCandidates`.
   retry_status_union: Arc<HashSet<u16>>,
 }
 
