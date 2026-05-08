@@ -194,13 +194,20 @@ pub struct ReverseProxyConfig {
 }
 
 /// Per-route passive-health input as carried from TOML to the backend builder.
+///
+/// Precedence: if a status appears in both `unhealthy_statuses` (here) and
+/// `app_fallback.fallback_on_statuses`, passive_health wins — the failure is recorded
+/// as a health observation and the upstream's health state is updated. This matches
+/// the principle that health observation is the stronger signal (5xx is "the upstream
+/// is sick" regardless of routing intent).
 #[derive(PartialEq, Eq, Clone, Debug)]
 pub struct PassiveHealthRoute {
   pub unhealthy_statuses: Option<Vec<u16>>,
   pub on_connection_failure: Option<bool>,
 }
 
-/// Per-route application-fallback input.
+/// Per-route application-fallback input. See `PassiveHealthRoute` for precedence rules
+/// when a status is configured in both lists.
 #[derive(PartialEq, Eq, Clone, Debug)]
 pub struct AppFallbackRoute {
   pub fallback_on_statuses: Vec<u16>,

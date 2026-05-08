@@ -85,10 +85,6 @@ impl<'a> LoadBalanceSticky {
     pick_nth_available_index(upstreams, count)
   }
 
-  #[cfg(test)]
-  fn get_server_id_from_index(&self, index: usize) -> String {
-    self.upstream_maps.upstream_index_map.get(index).unwrap().to_owned()
-  }
   /// This function takes value passed from outside. So 'result' is used.
   fn get_server_index_from_id(&self, id: impl Into<Cow<'a, str>>) -> Option<usize> {
     let id_str = id.into().to_string();
@@ -184,7 +180,7 @@ mod tests {
   }
 
   fn make_context_for(lb: &LoadBalanceSticky, index: usize) -> LoadBalanceContext {
-    let server_id = lb.get_server_id_from_index(index);
+    let server_id = lb.upstream_maps.upstream_index_map.get(index).unwrap().to_owned();
     LoadBalanceContext {
       sticky_cookie: StickyCookie {
         value: StickyCookieValue {

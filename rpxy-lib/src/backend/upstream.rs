@@ -58,13 +58,8 @@ impl TryFrom<&AppConfig> for PathManager {
         .collect();
 
       let mut builder = UpstreamCandidatesBuilder::default();
-      let passive_health_input = rpc.passive_health.as_ref().map(|p| super::failover::PassiveHealthInput {
-        unhealthy_statuses: p.unhealthy_statuses.clone(),
-        on_connection_failure: p.on_connection_failure,
-      });
-      let app_fallback_input = rpc.app_fallback.as_ref().map(|a| super::failover::AppFallbackInput {
-        fallback_on_statuses: a.fallback_on_statuses.clone(),
-      });
+      let passive_health_input = rpc.passive_health.as_ref().map(Into::into);
+      let app_fallback_input = rpc.app_fallback.as_ref().map(Into::into);
       builder
         .upstream(&upstream_vec)
         .path(&rpc.path)

@@ -5,6 +5,30 @@ use std::sync::Arc;
 /// configured without an explicit `unhealthy_statuses` list).
 const DEFAULT_UNHEALTHY_STATUSES: &[u16] = &[502, 503, 504];
 
+/// Precompute the union of trigger statuses across both sub-configs. Cheap-clone case
+/// (one sub-config set): reuse the existing `Arc<HashSet<u16>>`. Both-set: allocate the
+/// union once. `(None, None)` is unreachable from `build`, but we return an empty Arc
+/// defensively so the method is total.
+fn compute_retry_status_union(
+  passive_health: &Option<PassiveHealthConfig>,
+  app_fallback: &Option<AppFallbackConfig>,
+) -> Arc<HashSet<u16>> {
+  match (passive_health, app_fallback) {
+    (Some(ph), None) => ph.unhealthy_statuses.clone(),
+    (None, Some(af)) => af.fallback_on_statuses.clone(),
+    (Some(ph), Some(af)) => {
+      let merged: HashSet<u16> = ph
+        .unhealthy_statuses
+        .iter()
+        .chain(af.fallback_on_statuses.iter())
+        .copied()
+        .collect();
+      Arc::new(merged)
+    }
+    (None, None) => Arc::new(HashSet::default()),
+  }
+}
+
 /// Health-related failover triggers. Failures observed on real traffic update the
 /// upstream's `UpstreamHealth` state via `record(false)` (the same state the active
 /// `health-check` task drives) AND retry the current request against the next upstream.
@@ -40,6 +64,10 @@ pub struct FailoverConfig {
   /// RFC 9110 §9.2.2 only lists GET/HEAD/PUT/DELETE/OPTIONS/TRACE as idempotent;
   /// retrying others risks double-write side effects.
   pub retry_non_idempotent: bool,
+  /// Precomputed union of every status that triggers retry — built once at config-build
+  /// time so the request hot path returns a cheap `Arc::clone` instead of allocating a
+  /// fresh `HashSet` per request.
+  retry_status_union: Arc<HashSet<u16>>,
 }
 
 impl FailoverConfig {
@@ -66,11 +94,13 @@ impl FailoverConfig {
     let app_fallback = app_fallback.map(|a| AppFallbackConfig {
       fallback_on_statuses: Arc::new(a.fallback_on_statuses.into_iter().collect()),
     });
+    let retry_status_union = compute_retry_status_union(&passive_health, &app_fallback);
     Some(Self {
       passive_health,
       app_fallback,
       max_retries: max_retries.unwrap_or_else(|| num_upstreams.saturating_sub(1)),
       retry_non_idempotent: retry_non_idempotent.unwrap_or(false),
+      retry_status_union,
     })
   }
 
@@ -100,27 +130,25 @@ impl FailoverConfig {
 
   /// Union of every status code that should trigger retry, regardless of whether the
   /// trigger came from passive_health or app_fallback. Used for the cache-skip extension
-  /// so triggering responses don't poison the response cache.
+  /// so triggering responses don't poison the response cache. Cheap `Arc::clone` —
+  /// the union is precomputed once in `build` and never mutated.
   pub fn all_retry_statuses(&self) -> Arc<HashSet<u16>> {
-    match (&self.passive_health, &self.app_fallback) {
-      (Some(ph), None) => ph.unhealthy_statuses.clone(),
-      (None, Some(af)) => af.fallback_on_statuses.clone(),
-      (Some(ph), Some(af)) => {
-        let merged: HashSet<u16> = ph
-          .unhealthy_statuses
-          .iter()
-          .chain(af.fallback_on_statuses.iter())
-          .copied()
-          .collect();
-        Arc::new(merged)
-      }
-      (None, None) => Arc::new(HashSet::default()),
-    }
+    self.retry_status_union.clone()
+  }
+
+  /// Convenience predicate: returns true if `status` is a passive_health failure trigger.
+  /// Equivalent to `matches!(self.classify_status(status), StatusClassification::HealthFailure)`
+  /// but avoids walking app_fallback when only the health verdict matters.
+  pub(crate) fn is_health_failure_status(&self, status: u16) -> bool {
+    self
+      .passive_health
+      .as_ref()
+      .is_some_and(|ph| ph.unhealthy_statuses.contains(&status))
   }
 
   /// Classify a response status against the configured triggers. Used by the retry loop
   /// to decide whether to retry, record health failure, or pass through.
-  pub fn classify_status(&self, status: u16) -> StatusClassification {
+  pub(crate) fn classify_status(&self, status: u16) -> StatusClassification {
     let passive_match = self
       .passive_health
       .as_ref()
@@ -153,9 +181,26 @@ pub struct AppFallbackInput {
   pub fallback_on_statuses: Vec<u16>,
 }
 
+impl From<&crate::globals::PassiveHealthRoute> for PassiveHealthInput {
+  fn from(r: &crate::globals::PassiveHealthRoute) -> Self {
+    Self {
+      unhealthy_statuses: r.unhealthy_statuses.clone(),
+      on_connection_failure: r.on_connection_failure,
+    }
+  }
+}
+
+impl From<&crate::globals::AppFallbackRoute> for AppFallbackInput {
+  fn from(r: &crate::globals::AppFallbackRoute) -> Self {
+    Self {
+      fallback_on_statuses: r.fallback_on_statuses.clone(),
+    }
+  }
+}
+
 /// Outcome of classifying a response status against the failover config.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StatusClassification {
+pub(crate) enum StatusClassification {
   /// Status indicates upstream health failure: record it and retry.
   HealthFailure,
   /// Status indicates application-level routing fallback: retry without touching health.
@@ -305,6 +350,39 @@ mod tests {
     assert!(union.contains(&502));
     assert!(union.contains(&503));
     assert!(union.contains(&404));
+  }
+
+  #[test]
+  fn all_retry_statuses_passive_only_reuses_arc() {
+    let cfg = FailoverConfig::build(Some(ph(Some(vec![502, 503]), None)), None, None, None, 2).unwrap();
+    let union = cfg.all_retry_statuses();
+    assert_eq!(union.len(), 2);
+    assert!(union.contains(&502));
+    assert!(union.contains(&503));
+    // No allocation: the Arc returned shares the same allocation as passive_health.unhealthy_statuses.
+    assert!(Arc::ptr_eq(&union, &cfg.passive_health.as_ref().unwrap().unhealthy_statuses));
+  }
+
+  #[test]
+  fn all_retry_statuses_app_fallback_only_reuses_arc() {
+    let cfg = FailoverConfig::build(None, Some(af(vec![404])), None, None, 2).unwrap();
+    let union = cfg.all_retry_statuses();
+    assert_eq!(union.len(), 1);
+    assert!(union.contains(&404));
+    assert!(Arc::ptr_eq(&union, &cfg.app_fallback.as_ref().unwrap().fallback_on_statuses));
+  }
+
+  #[test]
+  fn is_health_failure_status_only_matches_passive_health() {
+    let cfg = FailoverConfig::build(Some(ph(Some(vec![502]), None)), Some(af(vec![404])), None, None, 2).unwrap();
+    assert!(cfg.is_health_failure_status(502));
+    assert!(!cfg.is_health_failure_status(404));
+    assert!(!cfg.is_health_failure_status(200));
+
+    // App-fallback-only config: every status returns false (no health observation).
+    let cfg = FailoverConfig::build(None, Some(af(vec![404])), None, None, 2).unwrap();
+    assert!(!cfg.is_health_failure_status(404));
+    assert!(!cfg.is_health_failure_status(502));
   }
 
   #[test]

@@ -217,19 +217,20 @@ where
       log_data.xff(&req.headers().get(header_defs::X_FORWARDED_FOR));
       log_data.upstream(req.uri());
 
+      // Capture the method before `req` is consumed so passive health can gate
+      // negative observations on idempotency.
+      let req_method = req.method().clone();
       let res_result = self.forwarder.request(req).await;
       // Feed the outcome into passive health (no-op unless passive_health is configured).
       // This applies even on routes that can't retry (single upstream, body unbufferable,
       // non-idempotent without opt-in) — observation is independent of retry.
       match &res_result {
         Ok(response) => {
-          let ok = !upstream_candidates.failover_config.as_ref().is_some_and(|cfg| {
-            matches!(
-              cfg.classify_status(response.status().as_u16()),
-              crate::backend::StatusClassification::HealthFailure
-            )
-          });
-          record_passive_health(upstream_candidates, chosen_idx, ok);
+          let ok = !upstream_candidates
+            .failover_config
+            .as_ref()
+            .is_some_and(|cfg| cfg.is_health_failure_status(response.status().as_u16()));
+          record_passive_health(upstream_candidates, chosen_idx, ok, &req_method);
         }
         Err(_) => {
           let observe = upstream_candidates
@@ -238,7 +239,7 @@ where
             .and_then(|cfg| cfg.passive_health.as_ref())
             .is_some_and(|p| p.on_connection_failure);
           if observe {
-            record_passive_health(upstream_candidates, chosen_idx, false);
+            record_passive_health(upstream_candidates, chosen_idx, false, &req_method);
           }
         }
       }
@@ -459,7 +460,7 @@ where
                 "Upstream[{}] returned status {} (passive health failure); will retry next upstream",
                 chosen_idx, status
               );
-              record_passive_health(upstream_candidates, chosen_idx, false);
+              record_passive_health(upstream_candidates, chosen_idx, false, &req_parts.method);
               if let Some(prev) = last_response.take() {
                 self.spawn_drain_response(prev);
               }
@@ -479,7 +480,7 @@ where
             }
             crate::backend::StatusClassification::Pass => {
               // Treat a non-trigger status as a positive health signal.
-              record_passive_health(upstream_candidates, chosen_idx, true);
+              record_passive_health(upstream_candidates, chosen_idx, true, &req_parts.method);
               if let Some(prev) = last_response.take() {
                 self.spawn_drain_response(prev);
               }
@@ -497,7 +498,7 @@ where
               "Upstream[{}] connection failed: {} (passive health failure); will retry next upstream",
               chosen_idx, e
             );
-            record_passive_health(upstream_candidates, chosen_idx, false);
+            record_passive_health(upstream_candidates, chosen_idx, false, &req_parts.method);
             last_lb_context = handler_context.context_lb;
           } else {
             if let Some(prev) = last_response.take() {
@@ -572,13 +573,25 @@ fn is_idempotent_method(method: &Method) -> bool {
 /// `health-check` configured (which provides the `UpstreamHealth` slot). A flipped
 /// state from this observation makes future load-balancer picks skip the upstream
 /// the same way an active probe failure would.
-fn record_passive_health(upstream_candidates: &UpstreamCandidates, chosen_idx: usize, ok: bool) {
+///
+/// Negative observations (`ok = false`) are additionally gated on method idempotency:
+/// a non-idempotent method (POST, PATCH, etc.) is only allowed to mark an upstream
+/// unhealthy when the operator explicitly opts in via `failover_non_idempotent_methods`.
+/// This prevents an attacker from using crafted POSTs that reproducibly elicit 502
+/// from a healthy upstream to take it out of rotation. Positive observations
+/// (`ok = true`) are always recorded.
+fn record_passive_health(upstream_candidates: &UpstreamCandidates, chosen_idx: usize, ok: bool, method: &Method) {
   #[cfg(feature = "health-check")]
   {
     let Some(cfg) = &upstream_candidates.failover_config else {
       return;
     };
     if cfg.passive_health.is_none() {
+      return;
+    }
+    if !ok && !cfg.retry_non_idempotent && !is_idempotent_method(method) {
+      // Non-idempotent failure on a route that didn't opt into non-idempotent retry —
+      // skip the negative observation to avoid the DoS amplification path.
       return;
     }
     let Some(upstream) = upstream_candidates.inner.get(chosen_idx) else {
@@ -597,7 +610,7 @@ fn record_passive_health(upstream_candidates: &UpstreamCandidates, chosen_idx: u
   }
   #[cfg(not(feature = "health-check"))]
   {
-    let _ = (upstream_candidates, chosen_idx, ok);
+    let _ = (upstream_candidates, chosen_idx, ok, method);
   }
 }
 
