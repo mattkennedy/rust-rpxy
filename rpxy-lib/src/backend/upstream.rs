@@ -47,15 +47,24 @@ impl TryFrom<&AppConfig> for PathManager {
         .iter()
         .map(Upstream::from)
         .map(|u| Upstream {
-          health: rpc
-            .health_check
-            .as_ref()
-            .map(|_| Arc::new(super::health_check::UpstreamHealth::new())),
+          health: rpc.health_check.as_ref().map(|hc| {
+            Arc::new(super::health_check::UpstreamHealth::new(
+              hc.unhealthy_threshold,
+              hc.healthy_threshold,
+            ))
+          }),
           ..u
         })
         .collect();
 
       let mut builder = UpstreamCandidatesBuilder::default();
+      let passive_health_input = rpc.passive_health.as_ref().map(|p| super::failover::PassiveHealthInput {
+        unhealthy_statuses: p.unhealthy_statuses.clone(),
+        on_connection_failure: p.on_connection_failure,
+      });
+      let app_fallback_input = rpc.app_fallback.as_ref().map(|a| super::failover::AppFallbackInput {
+        fallback_on_statuses: a.fallback_on_statuses.clone(),
+      });
       builder
         .upstream(&upstream_vec)
         .path(&rpc.path)
@@ -63,10 +72,10 @@ impl TryFrom<&AppConfig> for PathManager {
         .load_balance(&rpc.load_balance, &upstream_vec, &app_config.server_name, &rpc.path)
         .options(&rpc.upstream_options)
         .failover(
-          &rpc.failover_on_statuses,
-          &rpc.failover_on_connection_failure,
-          &rpc.max_failover_retries,
-          &rpc.failover_non_idempotent_methods,
+          passive_health_input,
+          app_fallback_input,
+          rpc.max_failover_retries,
+          rpc.failover_non_idempotent_methods,
           upstream_vec.len(),
         );
 
@@ -294,35 +303,29 @@ impl UpstreamCandidatesBuilder {
   }
 
   /// Set the failover configuration. Failover is only enabled when there is more than one
-  /// upstream AND at least one failover option is specified by the user. Otherwise the
-  /// `failover_config` is left as `None` (no retry behavior).
+  /// upstream AND at least one of `passive_health`/`app_fallback` is specified.
+  /// Otherwise `failover_config` stays `None`.
   pub fn failover(
     &mut self,
-    statuses: &Option<Vec<u16>>,
-    on_connection_failure: &Option<bool>,
-    max_retries: &Option<usize>,
-    retry_non_idempotent: &Option<bool>,
+    passive_health: Option<super::failover::PassiveHealthInput>,
+    app_fallback: Option<super::failover::AppFallbackInput>,
+    max_retries: Option<usize>,
+    retry_non_idempotent: Option<bool>,
     num_upstreams: usize,
   ) -> &mut Self {
-    let any_option_specified =
-      statuses.is_some() || on_connection_failure.is_some() || max_retries.is_some() || retry_non_idempotent.is_some();
-    if num_upstreams > 1 && any_option_specified {
-      let cfg = FailoverConfig::new(
-        statuses.clone(),
-        *on_connection_failure,
-        *max_retries,
-        *retry_non_idempotent,
-        num_upstreams,
-      );
-      match cfg.validate() {
+    if num_upstreams <= 1 {
+      self.failover_config = Some(None);
+      return self;
+    }
+    match FailoverConfig::build(passive_health, app_fallback, max_retries, retry_non_idempotent, num_upstreams) {
+      None => self.failover_config = Some(None),
+      Some(cfg) => match cfg.validate() {
         Ok(()) => self.failover_config = Some(Some(cfg)),
         Err(e) => {
           error!("Invalid failover configuration ({e}); failover disabled for this route");
           self.failover_config = Some(None);
         }
-      }
-    } else {
-      self.failover_config = Some(None);
+      },
     }
     self
   }

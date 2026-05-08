@@ -167,7 +167,7 @@ mod tests {
 
   #[cfg(feature = "health-check")]
   fn make_upstream_with_health(uri_str: &str, healthy: bool) -> Upstream {
-    let health = Arc::new(crate::backend::health_check::UpstreamHealth::new());
+    let health = Arc::new(crate::backend::health_check::UpstreamHealth::new(3, 2));
     health.set(healthy);
     Upstream {
       uri: uri_str.parse::<hyper::Uri>().unwrap(),

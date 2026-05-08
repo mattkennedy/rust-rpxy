@@ -205,6 +205,7 @@ where
           None, // let the load balancer pick
         )
         .map_err(|e| HttpError::FailedToGenerateUpstreamRequest(e.to_string()))?;
+      let chosen_idx = handler_context.chosen_upstream_idx;
 
       debug!(
         "Request to be forwarded: [uri {}, method: {}, version {:?}, headers {:?}]",
@@ -216,11 +217,32 @@ where
       log_data.xff(&req.headers().get(header_defs::X_FORWARDED_FOR));
       log_data.upstream(req.uri());
 
-      let res = self
-        .forwarder
-        .request(req)
-        .await
-        .map_err(|e| HttpError::FailedToGetResponseFromBackend(e.to_string()))?;
+      let res_result = self.forwarder.request(req).await;
+      // Feed the outcome into passive health (no-op unless passive_health is configured).
+      // This applies even on routes that can't retry (single upstream, body unbufferable,
+      // non-idempotent without opt-in) — observation is independent of retry.
+      match &res_result {
+        Ok(response) => {
+          let ok = !upstream_candidates.failover_config.as_ref().is_some_and(|cfg| {
+            matches!(
+              cfg.classify_status(response.status().as_u16()),
+              crate::backend::StatusClassification::HealthFailure
+            )
+          });
+          record_passive_health(upstream_candidates, chosen_idx, ok);
+        }
+        Err(_) => {
+          let observe = upstream_candidates
+            .failover_config
+            .as_ref()
+            .and_then(|cfg| cfg.passive_health.as_ref())
+            .is_some_and(|p| p.on_connection_failure);
+          if observe {
+            record_passive_health(upstream_candidates, chosen_idx, false);
+          }
+        }
+      }
+      let res = res_result.map_err(|e| HttpError::FailedToGetResponseFromBackend(e.to_string()))?;
       (res, handler_context.context_lb)
     };
 
@@ -365,14 +387,14 @@ where
       .as_ref()
       .expect("failover_config must be Some when entering request_with_failover");
 
-    // The trigger-status set is already Arc-shared in FailoverConfig; clone the Arc once
-    // here so each per-attempt extension insert is just a refcount bump.
-    let no_cache_statuses = failover_config.trigger_statuses.clone();
+    // Union of every status that triggers retry — used to skip cache storage so a
+    // triggering response can't poison the cache for subsequent requests.
+    let no_cache_statuses = failover_config.all_retry_statuses();
     let max_retries = failover_config.max_retries.min(upstream_candidates.inner.len() - 1);
 
     debug!(
-      "Failover starting: max_retries={}, trigger_statuses={:?}, on_connection_failure={}, retry_non_idempotent={}",
-      max_retries, failover_config.trigger_statuses, failover_config.on_connection_failure, failover_config.retry_non_idempotent,
+      "Failover starting: max_retries={}, passive_health={:?}, app_fallback={:?}, retry_non_idempotent={}",
+      max_retries, failover_config.passive_health, failover_config.app_fallback, failover_config.retry_non_idempotent,
     );
 
     // initial_upstream_idx is filled in after attempt 0 returns (we don't pre-probe).
@@ -431,32 +453,53 @@ where
       match self.forwarder.request(forwarded_req).await {
         Ok(response) => {
           let status = response.status();
-          if failover_config.trigger_statuses.contains(&status.as_u16()) {
-            warn!(
-              "Upstream[{}] returned status {} matching failover triggers; will retry next upstream",
-              chosen_idx, status
-            );
-            // Drain the previously-captured trigger response (if any) so its connection
-            // can be returned to the keep-alive pool instead of being closed.
-            if let Some(prev) = last_response.take() {
-              self.spawn_drain_response(prev);
+          match failover_config.classify_status(status.as_u16()) {
+            crate::backend::StatusClassification::HealthFailure => {
+              warn!(
+                "Upstream[{}] returned status {} (passive health failure); will retry next upstream",
+                chosen_idx, status
+              );
+              record_passive_health(upstream_candidates, chosen_idx, false);
+              if let Some(prev) = last_response.take() {
+                self.spawn_drain_response(prev);
+              }
+              last_response = Some(response);
+              last_lb_context = handler_context.context_lb;
             }
-            last_response = Some(response);
-            last_lb_context = handler_context.context_lb;
-          } else {
-            // Success — drain any captured trigger response before returning.
-            if let Some(prev) = last_response.take() {
-              self.spawn_drain_response(prev);
+            crate::backend::StatusClassification::AppFallback => {
+              warn!(
+                "Upstream[{}] returned status {} (app fallback); will retry next upstream",
+                chosen_idx, status
+              );
+              if let Some(prev) = last_response.take() {
+                self.spawn_drain_response(prev);
+              }
+              last_response = Some(response);
+              last_lb_context = handler_context.context_lb;
             }
-            return Ok((response, handler_context.context_lb));
+            crate::backend::StatusClassification::Pass => {
+              // Treat a non-trigger status as a positive health signal.
+              record_passive_health(upstream_candidates, chosen_idx, true);
+              if let Some(prev) = last_response.take() {
+                self.spawn_drain_response(prev);
+              }
+              return Ok((response, handler_context.context_lb));
+            }
           }
         }
         Err(e) => {
-          if failover_config.on_connection_failure {
-            warn!("Upstream[{}] connection failed: {}; will retry next upstream", chosen_idx, e);
+          let observe_conn_failure = failover_config
+            .passive_health
+            .as_ref()
+            .is_some_and(|p| p.on_connection_failure);
+          if observe_conn_failure {
+            warn!(
+              "Upstream[{}] connection failed: {} (passive health failure); will retry next upstream",
+              chosen_idx, e
+            );
+            record_passive_health(upstream_candidates, chosen_idx, false);
             last_lb_context = handler_context.context_lb;
           } else {
-            // Drain any pending trigger response before bailing out.
             if let Some(prev) = last_response.take() {
               self.spawn_drain_response(prev);
             }
@@ -522,6 +565,40 @@ fn is_idempotent_method(method: &Method) -> bool {
     *method,
     Method::GET | Method::HEAD | Method::PUT | Method::DELETE | Method::OPTIONS | Method::TRACE
   )
+}
+
+/// Feed a real-traffic outcome into the upstream's `UpstreamHealth` counter.
+/// No-op unless `passive_health` is configured for the route AND the upstream has
+/// `health-check` configured (which provides the `UpstreamHealth` slot). A flipped
+/// state from this observation makes future load-balancer picks skip the upstream
+/// the same way an active probe failure would.
+fn record_passive_health(upstream_candidates: &UpstreamCandidates, chosen_idx: usize, ok: bool) {
+  #[cfg(feature = "health-check")]
+  {
+    let Some(cfg) = &upstream_candidates.failover_config else {
+      return;
+    };
+    if cfg.passive_health.is_none() {
+      return;
+    }
+    let Some(upstream) = upstream_candidates.inner.get(chosen_idx) else {
+      return;
+    };
+    let Some(health) = &upstream.health else {
+      return;
+    };
+    if let Some(new_state) = health.record(ok) {
+      debug!(
+        "Passive health observation flipped upstream[{}] -> {}",
+        chosen_idx,
+        if new_state { "healthy" } else { "unhealthy" }
+      );
+    }
+  }
+  #[cfg(not(feature = "health-check"))]
+  {
+    let _ = (upstream_candidates, chosen_idx, ok);
+  }
 }
 
 #[cfg(test)]

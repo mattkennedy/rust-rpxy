@@ -29,7 +29,9 @@ use tokio_util::sync::CancellationToken;
 /* ------------------------------------------------ */
 pub use crate::{
   constants::log_event_names,
-  globals::{AppConfig, AppConfigList, ProxyConfig, ReverseProxyConfig, TlsConfig, UpstreamUri},
+  globals::{
+    AppConfig, AppConfigList, AppFallbackRoute, PassiveHealthRoute, ProxyConfig, ReverseProxyConfig, TlsConfig, UpstreamUri,
+  },
 };
 
 #[cfg(feature = "health-check")]

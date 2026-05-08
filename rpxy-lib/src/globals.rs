@@ -178,16 +178,32 @@ pub struct ReverseProxyConfig {
   pub upstream: Vec<UpstreamUri>,
   pub upstream_options: Option<Vec<String>>,
   pub load_balance: Option<String>,
-  /// HTTP status codes that trigger upstream failover (e.g. [502, 503, 504])
-  pub failover_on_statuses: Option<Vec<u16>>,
-  /// Whether to failover on connection failures (timeout, refused, etc.)
-  pub failover_on_connection_failure: Option<bool>,
-  /// Maximum retry attempts (default: number of upstreams - 1)
+  /// Health-related failover. Failures here update upstream health state (via the
+  /// existing `health-check` machinery) AND retry the current request.
+  pub passive_health: Option<PassiveHealthRoute>,
+  /// Application-level routing fallback (e.g. migration). Retries the current request
+  /// without touching upstream health state.
+  pub app_fallback: Option<AppFallbackRoute>,
+  /// Maximum failover retry attempts. Applies to both passive_health and app_fallback
+  /// triggers. Default: number of upstreams - 1.
   pub max_failover_retries: Option<usize>,
-  /// Opt-in to retry POST/PATCH methods (default false; only idempotent methods retry).
+  /// Opt-in to retry POST/PATCH methods. Default false (only idempotent methods retry).
   pub failover_non_idempotent_methods: Option<bool>,
   #[cfg(feature = "health-check")]
   pub health_check: Option<HealthCheckConfig>,
+}
+
+/// Per-route passive-health input as carried from TOML to the backend builder.
+#[derive(PartialEq, Eq, Clone, Debug)]
+pub struct PassiveHealthRoute {
+  pub unhealthy_statuses: Option<Vec<u16>>,
+  pub on_connection_failure: Option<bool>,
+}
+
+/// Per-route application-fallback input.
+#[derive(PartialEq, Eq, Clone, Debug)]
+pub struct AppFallbackRoute {
+  pub fallback_on_statuses: Vec<u16>,
 }
 
 #[cfg(feature = "health-check")]

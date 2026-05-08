@@ -1,4 +1,4 @@
-use super::{UpstreamHealth, check_http::HealthCheckHttpClient, check_tcp::check_tcp, counter::ConsecutiveCounter};
+use super::{UpstreamHealth, check_http::HealthCheckHttpClient, check_tcp::check_tcp};
 use crate::{
   backend::BackendAppManager,
   error::RpxyResult,
@@ -96,10 +96,6 @@ async fn run_health_checker(
   cancel: CancellationToken,
   http_client: Option<Arc<HealthCheckHttpClient>>,
 ) -> RpxyResult<()> {
-  let mut counters: Vec<ConsecutiveCounter> = upstreams
-    .iter()
-    .map(|_| ConsecutiveCounter::new(config.unhealthy_threshold, config.healthy_threshold))
-    .collect();
   let mut ticker = tokio::time::interval(config.interval);
   ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
@@ -134,13 +130,12 @@ async fn run_health_checker(
           if !ok {
             debug!("[{server_name}:{path_str}] Health check failed for {uri}");
           }
-          if let Some(new_state) = counters[i].record(ok) {
+          if let Some(new_state) = health.record(ok) {
             if new_state {
               info!("[{server_name}:{path_str}] Upstream {uri} is now healthy ({} consecutive successes)", config.healthy_threshold);
             } else {
               info!("[{server_name}:{path_str}] Upstream {uri} is now unhealthy ({} consecutive failures)", config.unhealthy_threshold);
             }
-            health.set(new_state);
           }
         });
 

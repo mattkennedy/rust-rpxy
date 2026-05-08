@@ -5,7 +5,7 @@ use crate::{
 };
 use ahash::HashMap;
 use rpxy_lib::{
-  AppConfig, AppConfigList, ProxyConfig, ReverseProxyConfig, TlsConfig, UpstreamUri,
+  AppConfig, AppConfigList, AppFallbackRoute, PassiveHealthRoute, ProxyConfig, ReverseProxyConfig, TlsConfig, UpstreamUri,
   reexports::{IpNet, Uri},
 };
 use rpxy_trusted_proxies::resolve_trusted_proxy_entries;
@@ -228,18 +228,36 @@ pub struct ReverseProxyOption {
   pub upstream: Vec<UpstreamParams>,
   pub upstream_options: Option<Vec<String>>,
   pub load_balance: Option<String>,
-  /// HTTP status codes that trigger failover to the next upstream (e.g. [502, 503, 504]).
-  pub failover_on_statuses: Option<Vec<u16>>,
-  /// Whether to failover when the upstream connection itself fails (timeout, refused, etc.).
-  pub failover_on_connection_failure: Option<bool>,
-  /// Maximum failover retry attempts per request. Defaults to `upstream.len() - 1`.
+  /// Health-related failover. Failures here update upstream health state (via the
+  /// existing `health-check` machinery — `health_check` must also be configured) AND
+  /// retry the current request against the next upstream.
+  pub passive_health: Option<PassiveHealthOption>,
+  /// Application-level routing fallback (e.g. migration / canary). Triggers retry
+  /// without affecting upstream health state.
+  pub app_fallback: Option<AppFallbackOption>,
+  /// Maximum failover retry attempts per request. Applies to both passive_health and
+  /// app_fallback triggers. Defaults to `upstream.len() - 1`.
   pub max_failover_retries: Option<usize>,
   /// Opt-in: enable failover for non-idempotent methods (POST, PATCH).
   /// Default `false` — only idempotent methods (GET/HEAD/PUT/DELETE/OPTIONS/TRACE) retry.
-  /// Risk of double-charge / double-write if upstream processed the side effect before responding.
+  /// Risk of double-write if upstream processed the side effect before responding.
   pub failover_non_idempotent_methods: Option<bool>,
   #[cfg(feature = "health-check")]
   pub health_check: Option<HealthCheckOption>,
+}
+
+#[derive(Deserialize, Debug, Default, PartialEq, Eq, Clone)]
+pub struct PassiveHealthOption {
+  /// Status codes treated as health failures (default `[502, 503, 504]`).
+  pub unhealthy_statuses: Option<Vec<u16>>,
+  /// Whether connection errors count as health failures (default `true`).
+  pub on_connection_failure: Option<bool>,
+}
+
+#[derive(Deserialize, Debug, PartialEq, Eq, Clone)]
+pub struct AppFallbackOption {
+  /// Status codes that trigger routing fallback to the next upstream. Required.
+  pub fallback_on_statuses: Vec<u16>,
 }
 
 #[cfg(feature = "health-check")]
@@ -600,17 +618,52 @@ impl TryInto<Vec<ReverseProxyConfig>> for &Application {
       }
       let upstream = upstream_res.into_iter().map(|v| v.unwrap()).collect();
 
-      // Validate failover trigger status codes if present
-      if let Some(ref statuses) = rpo.failover_on_statuses {
+      // Validate failover trigger status codes (passive_health + app_fallback)
+      if let Some(ph) = &rpo.passive_health
+        && let Some(statuses) = &ph.unhealthy_statuses
+      {
         for &status in statuses {
           ensure!(
             (400..600).contains(&status),
-            "[{}] failover_on_statuses contains {} which is not in the 400-599 range",
+            "[{}] passive_health.unhealthy_statuses contains {} (must be 400-599)",
             &_server_name_string,
             status
           );
         }
       }
+      if let Some(af) = &rpo.app_fallback {
+        ensure!(
+          !af.fallback_on_statuses.is_empty(),
+          "[{}] app_fallback.fallback_on_statuses must not be empty",
+          &_server_name_string,
+        );
+        for &status in &af.fallback_on_statuses {
+          ensure!(
+            (400..600).contains(&status),
+            "[{}] app_fallback.fallback_on_statuses contains {} (must be 400-599)",
+            &_server_name_string,
+            status
+          );
+        }
+      }
+      // passive_health requires health_check to be configured (otherwise the
+      // observation has nowhere to land — health state is never created).
+      #[cfg(feature = "health-check")]
+      if rpo.passive_health.is_some() {
+        ensure!(
+          rpo.health_check.is_some(),
+          "[{}] passive_health requires health_check to also be configured for this route",
+          &_server_name_string,
+        );
+      }
+
+      let passive_health = rpo.passive_health.as_ref().map(|p| PassiveHealthRoute {
+        unhealthy_statuses: p.unhealthy_statuses.clone(),
+        on_connection_failure: p.on_connection_failure,
+      });
+      let app_fallback = rpo.app_fallback.as_ref().map(|a| AppFallbackRoute {
+        fallback_on_statuses: a.fallback_on_statuses.clone(),
+      });
 
       #[cfg(feature = "health-check")]
       let health_check = rpo
@@ -626,8 +679,8 @@ impl TryInto<Vec<ReverseProxyConfig>> for &Application {
         upstream,
         upstream_options: rpo.upstream_options.clone(),
         load_balance: rpo.load_balance.clone(),
-        failover_on_statuses: rpo.failover_on_statuses.clone(),
-        failover_on_connection_failure: rpo.failover_on_connection_failure,
+        passive_health,
+        app_fallback,
         max_failover_retries: rpo.max_failover_retries,
         failover_non_idempotent_methods: rpo.failover_non_idempotent_methods,
         #[cfg(feature = "health-check")]
@@ -1094,8 +1147,8 @@ mod tests {
         upstream: vec![],
         upstream_options: None,
         load_balance: None,
-        failover_on_statuses: None,
-        failover_on_connection_failure: None,
+        passive_health: None,
+        app_fallback: None,
         max_failover_retries: None,
         failover_non_idempotent_methods: None,
         #[cfg(feature = "health-check")]

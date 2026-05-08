@@ -1,5 +1,6 @@
 /// Tracks consecutive success/failure counts to determine health state transitions.
 /// Only triggers a state change when a threshold is crossed.
+#[derive(Debug)]
 pub(super) struct ConsecutiveCounter {
   consecutive_ok: u32,
   consecutive_fail: u32,

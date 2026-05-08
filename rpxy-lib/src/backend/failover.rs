@@ -1,56 +1,167 @@
 use ahash::HashSet;
 use std::sync::Arc;
 
-/// Default HTTP status codes that trigger failover when no list is configured.
-const DEFAULT_TRIGGER_STATUSES: &[u16] = &[502, 503, 504];
+/// Default HTTP status codes treated as health failures (used when `passive_health` is
+/// configured without an explicit `unhealthy_statuses` list).
+const DEFAULT_UNHEALTHY_STATUSES: &[u16] = &[502, 503, 504];
 
-/// Configuration for failover behavior when upstreams return errors
+/// Health-related failover triggers. Failures observed on real traffic update the
+/// upstream's `UpstreamHealth` state via `record(false)` (the same state the active
+/// `health-check` task drives) AND retry the current request against the next upstream.
+/// Requires `health-check` to be configured on the same `[[reverse_proxy]]` block;
+/// without `health-check` the observation has nowhere to land.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PassiveHealthConfig {
+  /// HTTP status codes treated as health failures (default `[502, 503, 504]`).
+  pub unhealthy_statuses: Arc<HashSet<u16>>,
+  /// Whether to treat connection errors (timeout, refused, etc.) as health failures.
+  pub on_connection_failure: bool,
+}
+
+/// Application-level routing fallback for migration / canary scenarios. Triggers retry
+/// against the next upstream WITHOUT touching upstream health state — these statuses
+/// indicate the application doesn't have a route, not that the upstream is sick.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppFallbackConfig {
+  /// HTTP status codes that trigger a routing retry (e.g. `[404, 501]` for migration).
+  pub fallback_on_statuses: Arc<HashSet<u16>>,
+}
+
+/// Combined failover behavior. At least one of `passive_health` or `app_fallback` must
+/// be set for the config to exist on an upstream group; if both are `None`, the route
+/// has no failover configured and `UpstreamCandidates::failover_config` is `None`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FailoverConfig {
-  /// HTTP status codes that trigger failover (e.g., 502, 503, 504). Wrapped in `Arc` so
-  /// the failover path can attach it to per-attempt request extensions without cloning
-  /// the underlying set on every request.
-  pub trigger_statuses: Arc<HashSet<u16>>,
-  /// Whether to failover on connection failures (timeout, refused, etc.)
-  pub on_connection_failure: bool,
-  /// Maximum number of retry attempts (default: number of upstreams - 1)
+  pub passive_health: Option<PassiveHealthConfig>,
+  pub app_fallback: Option<AppFallbackConfig>,
+  /// Maximum retry attempts (default: number of upstreams - 1).
   pub max_retries: usize,
-  /// Opt-in: retry non-idempotent methods (POST, PATCH). Default `false`. RFC 9110 §9.2.2 only
-  /// guarantees idempotency for GET/HEAD/PUT/DELETE/OPTIONS/TRACE; retrying others risks
-  /// double-write side effects when an upstream processes the request then fails the response.
+  /// Opt-in to retry non-idempotent methods (POST/PATCH). Default `false`.
+  /// RFC 9110 §9.2.2 only lists GET/HEAD/PUT/DELETE/OPTIONS/TRACE as idempotent;
+  /// retrying others risks double-write side effects.
   pub retry_non_idempotent: bool,
 }
 
 impl FailoverConfig {
-  /// Create a new FailoverConfig with custom settings.
-  /// `max_retries` defaults to `num_upstreams - 1` when not specified.
-  pub fn new(
-    trigger_statuses: Option<Vec<u16>>,
-    on_connection_failure: Option<bool>,
+  /// Construct from raw TOML inputs. Returns `None` if neither passive_health nor
+  /// app_fallback is requested (caller treats as "no failover configured").
+  pub fn build(
+    passive_health: Option<PassiveHealthInput>,
+    app_fallback: Option<AppFallbackInput>,
     max_retries: Option<usize>,
     retry_non_idempotent: Option<bool>,
     num_upstreams: usize,
-  ) -> Self {
-    let statuses: HashSet<u16> = trigger_statuses
-      .map(|v| v.into_iter().collect())
-      .unwrap_or_else(|| DEFAULT_TRIGGER_STATUSES.iter().copied().collect());
-    Self {
-      trigger_statuses: Arc::new(statuses),
-      on_connection_failure: on_connection_failure.unwrap_or(true),
+  ) -> Option<Self> {
+    if passive_health.is_none() && app_fallback.is_none() {
+      return None;
+    }
+    let passive_health = passive_health.map(|p| PassiveHealthConfig {
+      unhealthy_statuses: Arc::new(
+        p.unhealthy_statuses
+          .map(|v| v.into_iter().collect())
+          .unwrap_or_else(|| DEFAULT_UNHEALTHY_STATUSES.iter().copied().collect()),
+      ),
+      on_connection_failure: p.on_connection_failure.unwrap_or(true),
+    });
+    let app_fallback = app_fallback.map(|a| AppFallbackConfig {
+      fallback_on_statuses: Arc::new(a.fallback_on_statuses.into_iter().collect()),
+    });
+    Some(Self {
+      passive_health,
+      app_fallback,
       max_retries: max_retries.unwrap_or_else(|| num_upstreams.saturating_sub(1)),
       retry_non_idempotent: retry_non_idempotent.unwrap_or(false),
-    }
+    })
   }
 
-  /// Validate that status codes are in the 4xx/5xx range
+  /// Validate that all configured status codes are in the 4xx/5xx range.
   pub fn validate(&self) -> Result<(), String> {
-    for &status in self.trigger_statuses.iter() {
-      if !(400..600).contains(&status) {
-        return Err(format!("Failover status code {status} must be in range 400-599"));
+    let in_range = |s: u16| (400..600).contains(&s);
+    if let Some(ph) = &self.passive_health {
+      for &status in ph.unhealthy_statuses.iter() {
+        if !in_range(status) {
+          return Err(format!(
+            "passive_health.unhealthy_statuses contains {status} (must be 400-599)"
+          ));
+        }
+      }
+    }
+    if let Some(af) = &self.app_fallback {
+      for &status in af.fallback_on_statuses.iter() {
+        if !in_range(status) {
+          return Err(format!(
+            "app_fallback.fallback_on_statuses contains {status} (must be 400-599)"
+          ));
+        }
       }
     }
     Ok(())
   }
+
+  /// Union of every status code that should trigger retry, regardless of whether the
+  /// trigger came from passive_health or app_fallback. Used for the cache-skip extension
+  /// so triggering responses don't poison the response cache.
+  pub fn all_retry_statuses(&self) -> Arc<HashSet<u16>> {
+    match (&self.passive_health, &self.app_fallback) {
+      (Some(ph), None) => ph.unhealthy_statuses.clone(),
+      (None, Some(af)) => af.fallback_on_statuses.clone(),
+      (Some(ph), Some(af)) => {
+        let merged: HashSet<u16> = ph
+          .unhealthy_statuses
+          .iter()
+          .chain(af.fallback_on_statuses.iter())
+          .copied()
+          .collect();
+        Arc::new(merged)
+      }
+      (None, None) => Arc::new(HashSet::default()),
+    }
+  }
+
+  /// Classify a response status against the configured triggers. Used by the retry loop
+  /// to decide whether to retry, record health failure, or pass through.
+  pub fn classify_status(&self, status: u16) -> StatusClassification {
+    let passive_match = self
+      .passive_health
+      .as_ref()
+      .is_some_and(|ph| ph.unhealthy_statuses.contains(&status));
+    if passive_match {
+      return StatusClassification::HealthFailure;
+    }
+    let app_match = self
+      .app_fallback
+      .as_ref()
+      .is_some_and(|af| af.fallback_on_statuses.contains(&status));
+    if app_match {
+      return StatusClassification::AppFallback;
+    }
+    StatusClassification::Pass
+  }
+}
+
+/// Raw TOML input for passive health (every field optional, defaults applied at build).
+#[derive(Debug, Clone, Default)]
+pub struct PassiveHealthInput {
+  pub unhealthy_statuses: Option<Vec<u16>>,
+  pub on_connection_failure: Option<bool>,
+}
+
+/// Raw TOML input for application-level fallback. `fallback_on_statuses` is required —
+/// there's no sensible default since this is a routing decision, not a health one.
+#[derive(Debug, Clone)]
+pub struct AppFallbackInput {
+  pub fallback_on_statuses: Vec<u16>,
+}
+
+/// Outcome of classifying a response status against the failover config.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatusClassification {
+  /// Status indicates upstream health failure: record it and retry.
+  HealthFailure,
+  /// Status indicates application-level routing fallback: retry without touching health.
+  AppFallback,
+  /// Status doesn't match any configured trigger: pass response through.
+  Pass,
 }
 
 /// Context tracking state during failover retries
@@ -99,79 +210,114 @@ impl FailoverContext {
 mod tests {
   use super::*;
 
-  #[test]
-  fn test_failover_config_defaults() {
-    let config = FailoverConfig::new(None, None, None, None, 3);
-    assert_eq!(config.trigger_statuses.len(), 3);
-    assert!(config.trigger_statuses.contains(&502));
-    assert!(config.trigger_statuses.contains(&503));
-    assert!(config.trigger_statuses.contains(&504));
-    assert!(config.on_connection_failure);
-    assert_eq!(config.max_retries, 2);
-    assert!(!config.retry_non_idempotent);
+  fn ph(statuses: Option<Vec<u16>>, on_connection_failure: Option<bool>) -> PassiveHealthInput {
+    PassiveHealthInput {
+      unhealthy_statuses: statuses,
+      on_connection_failure,
+    }
+  }
+
+  fn af(statuses: Vec<u16>) -> AppFallbackInput {
+    AppFallbackInput {
+      fallback_on_statuses: statuses,
+    }
   }
 
   #[test]
-  fn test_failover_config_new_overrides() {
-    let config = FailoverConfig::new(Some(vec![404, 502]), Some(false), Some(2), Some(true), 3);
-    assert_eq!(config.trigger_statuses.len(), 2);
-    assert!(config.trigger_statuses.contains(&404));
-    assert!(config.trigger_statuses.contains(&502));
-    assert!(!config.on_connection_failure);
-    assert_eq!(config.max_retries, 2);
-    assert!(config.retry_non_idempotent);
+  fn build_returns_none_when_neither_set() {
+    assert!(FailoverConfig::build(None, None, None, None, 3).is_none());
   }
 
   #[test]
-  fn test_failover_config_default_max_retries_from_upstream_count() {
-    let config = FailoverConfig::new(None, None, None, None, 3);
-    assert_eq!(config.max_retries, 2);
-
-    let config_zero = FailoverConfig::new(None, None, None, None, 0);
-    assert_eq!(config_zero.max_retries, 0);
+  fn build_passive_health_defaults() {
+    let cfg = FailoverConfig::build(Some(ph(None, None)), None, None, None, 3).unwrap();
+    let p = cfg.passive_health.unwrap();
+    assert_eq!(p.unhealthy_statuses.len(), 3);
+    assert!(p.unhealthy_statuses.contains(&502));
+    assert!(p.unhealthy_statuses.contains(&503));
+    assert!(p.unhealthy_statuses.contains(&504));
+    assert!(p.on_connection_failure);
+    assert!(cfg.app_fallback.is_none());
+    assert_eq!(cfg.max_retries, 2);
+    assert!(!cfg.retry_non_idempotent);
   }
 
   #[test]
-  fn test_failover_config_validate() {
-    let valid = FailoverConfig::new(Some(vec![404, 502, 503]), None, None, None, 2);
-    assert!(valid.validate().is_ok());
-
-    let invalid_low = FailoverConfig::new(Some(vec![200, 502]), None, None, None, 2);
-    assert!(invalid_low.validate().is_err());
-
-    let invalid_high = FailoverConfig::new(Some(vec![600]), None, None, None, 2);
-    assert!(invalid_high.validate().is_err());
+  fn build_passive_health_overrides() {
+    let cfg = FailoverConfig::build(Some(ph(Some(vec![500]), Some(false))), None, Some(5), Some(true), 3).unwrap();
+    let p = cfg.passive_health.unwrap();
+    assert!(p.unhealthy_statuses.contains(&500));
+    assert!(!p.on_connection_failure);
+    assert_eq!(cfg.max_retries, 5);
+    assert!(cfg.retry_non_idempotent);
   }
 
   #[test]
-  fn test_failover_context_tracking() {
-    let mut ctx = FailoverContext::new(0);
-    assert_eq!(ctx.initial_upstream_idx, 0);
-    assert_eq!(ctx.retry_count, 0);
-    // Initial upstream is NOT pre-marked to avoid skipping it
-    assert!(!ctx.has_tried(0));
-    assert!(!ctx.has_tried(1));
+  fn build_app_fallback_only() {
+    let cfg = FailoverConfig::build(None, Some(af(vec![404, 501])), None, None, 2).unwrap();
+    assert!(cfg.passive_health.is_none());
+    let a = cfg.app_fallback.unwrap();
+    assert_eq!(a.fallback_on_statuses.len(), 2);
+    assert!(a.fallback_on_statuses.contains(&404));
+  }
 
-    ctx.mark_tried(0);
-    assert!(ctx.has_tried(0));
-    assert!(!ctx.has_tried(1));
+  #[test]
+  fn build_both_sections() {
+    let cfg = FailoverConfig::build(Some(ph(Some(vec![502]), None)), Some(af(vec![404])), None, None, 3).unwrap();
+    assert!(cfg.passive_health.is_some());
+    assert!(cfg.app_fallback.is_some());
+  }
 
-    ctx.mark_tried(1);
-    assert!(ctx.has_tried(1));
+  #[test]
+  fn validate_rejects_out_of_range() {
+    let cfg = FailoverConfig::build(Some(ph(Some(vec![200]), None)), None, None, None, 2).unwrap();
+    assert!(cfg.validate().is_err());
+
+    let cfg = FailoverConfig::build(None, Some(af(vec![600])), None, None, 2).unwrap();
+    assert!(cfg.validate().is_err());
+
+    let cfg = FailoverConfig::build(Some(ph(Some(vec![502]), None)), Some(af(vec![404])), None, None, 2).unwrap();
+    assert!(cfg.validate().is_ok());
+  }
+
+  #[test]
+  fn classify_status_health_failure_takes_priority() {
+    // Same status in both lists — passive_health wins because health observation is the
+    // stronger signal (we want it recorded even if it's also in app_fallback).
+    let cfg = FailoverConfig::build(Some(ph(Some(vec![502]), None)), Some(af(vec![502])), None, None, 2).unwrap();
+    assert_eq!(cfg.classify_status(502), StatusClassification::HealthFailure);
+  }
+
+  #[test]
+  fn classify_status_routes_correctly() {
+    let cfg = FailoverConfig::build(Some(ph(Some(vec![502]), None)), Some(af(vec![404])), None, None, 2).unwrap();
+    assert_eq!(cfg.classify_status(502), StatusClassification::HealthFailure);
+    assert_eq!(cfg.classify_status(404), StatusClassification::AppFallback);
+    assert_eq!(cfg.classify_status(200), StatusClassification::Pass);
+    assert_eq!(cfg.classify_status(500), StatusClassification::Pass);
+  }
+
+  #[test]
+  fn all_retry_statuses_unions_both_sets() {
+    let cfg = FailoverConfig::build(Some(ph(Some(vec![502, 503]), None)), Some(af(vec![404])), None, None, 3).unwrap();
+    let union = cfg.all_retry_statuses();
+    assert_eq!(union.len(), 3);
+    assert!(union.contains(&502));
+    assert!(union.contains(&503));
+    assert!(union.contains(&404));
+  }
+
+  #[test]
+  fn failover_context_get_next_iterates_from_initial_index() {
+    let mut ctx = FailoverContext::new(2);
     assert!(!ctx.has_tried(2));
+    ctx.mark_tried(2);
+    assert!(ctx.has_tried(2));
+    assert!(!ctx.has_tried(0));
 
     ctx.increment_retry();
     assert_eq!(ctx.retry_count, 1);
-  }
-
-  #[test]
-  fn test_failover_context_can_retry() {
-    let mut ctx = FailoverContext::new(0);
     assert!(ctx.can_retry(2));
-
-    ctx.increment_retry();
-    assert!(ctx.can_retry(2));
-
     ctx.increment_retry();
     assert!(!ctx.can_retry(2));
   }
